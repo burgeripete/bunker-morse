@@ -74,7 +74,8 @@ Windows 10 2004 or later to capture a single process.
 
 1. Press **Start**. It waits for `DayZ_x64.exe` if the game is not running yet.
    Pick another process under **Listen to** if needed.
-2. Go somewhere you can hear the broadcast.
+2. In game, get a Handheld Transceiver or a Field Transceiver and tune it to
+   80 MHz at night, when the broadcast is on.
 3. Each complete block fills a bunker card. Coordinates appear both raw, as
    `057074`, and as a GPS reads them, as `X: 0.57  Y: 0.74`.
 4. Click a card's coordinates to open them on the iZurvive Nasdara map in your

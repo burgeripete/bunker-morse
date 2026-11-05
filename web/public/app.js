@@ -24,6 +24,7 @@ const ui = {
   status: element("status"),
   notice: element("notice"),
   lamp: element("lamp"),
+  mastLight: element("mast-light"),
   help: element("help"),
   bunkers: element("bunkers"),
   receiving: element("receiving"),
@@ -205,9 +206,9 @@ function span(className, text) {
   return node;
 }
 
-function digitRun(bunker, from, to) {
+function digitRun(bunker, from, to, className = "digits") {
   const run = document.createElement("div");
-  run.className = "digits";
+  run.className = className;
   for (let index = from; index < to; index++) {
     const digit = bunker?.digits[index];
     const known = digit && digit.digit >= 0;
@@ -250,7 +251,7 @@ function bunkerCard(index, bunker) {
   coordinates.append(head, digitRun(bunker, 0, 6), gps);
 
   const keypad = span("card-label", "Keypad code");
-  card.append(title, coordinates, keypad, digitRun(bunker, 6, 10));
+  card.append(title, coordinates, keypad, digitRun(bunker, 6, 10, "digits keypad"));
   return card;
 }
 
@@ -412,7 +413,9 @@ function renderReceiving() {
 
 function draw() {
   const signal = state.latest;
-  ui.lamp.classList.toggle("on", Boolean(signal?.on) && isRunning());
+  const beeping = Boolean(signal?.on) && isRunning();
+  ui.lamp.classList.toggle("on", beeping);
+  ui.mastLight.classList.toggle("on", beeping);
   const level = signal
     ? (signal.level - METER_FLOOR_DB) / -METER_FLOOR_DB
     : 0;

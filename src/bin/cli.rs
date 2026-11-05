@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use bunker_morse::bunkers::Bunkers;
@@ -11,12 +11,16 @@ use bunker_morse::capture::{self, CAPTURE_RATE};
 use bunker_morse::decoder::{Block, BlockKind, Element, Lead, format_code};
 use bunker_morse::detector::{DEFAULT_TONE_HZ, Threshold};
 use bunker_morse::engine::{Engine, Event, Listener, Source, Update};
+use bunker_morse::server;
 use bunker_morse::synth;
 
 const USAGE: &str = "\
 usage: bunker-morse-cli <command>
 
   apps                     list applications with audio sessions
+  server ADDRESS:PORT [--watch]
+                           ask a server for its game time, using its query port;
+                           --watch runs the clock and logs each correction
   decode FILE [--elements] [--threshold DB]
                            decode a recording (mkv, mp4, wav) as fast as
                            possible, printing blocks; --elements also prints
@@ -52,6 +56,15 @@ fn main() -> Result<()> {
     let target = args.iter().find(|a| !a.starts_with("--")).cloned();
     match command.as_str() {
         "apps" => apps(),
+        "server" => {
+            let address = target.context("a server address is required")?;
+            if args.iter().any(|a| a == "--watch") {
+                watch_clock(address);
+                Ok(())
+            } else {
+                server_info(address)
+            }
+        }
         "decode" => run(
             Source::File {
                 path: target.context("a file is required")?.into(),
@@ -67,6 +80,57 @@ fn main() -> Result<()> {
         ),
         "loopback-test" => loopback_test(),
         other => bail!("unknown command {other}\n\n{USAGE}"),
+    }
+}
+
+fn server_info(address: String) -> Result<()> {
+    let info = server::query(&address)?;
+    println!("{}", info.name);
+    println!("map      {}", info.map);
+    println!("version  {}", info.version);
+    println!("players  {}/{}", info.players, info.max_players);
+    match info.time {
+        Some(time) => println!("time     {time}"),
+        None => println!("time     not reported"),
+    }
+    if let Some(speed) = info.day_speed {
+        println!("day      {speed}x");
+    }
+    if let Some(speed) = info.night_speed {
+        println!("night    {speed}x");
+    }
+    Ok(())
+}
+
+fn watch_clock(address: String) {
+    let (_watch, results) = server::ServerWatch::start(address);
+    let mut clock: Option<server::GameClock> = None;
+    while let Ok(result) = results.recv() {
+        let now = Instant::now();
+        let info = match result {
+            Ok(info) => info,
+            Err(error) => {
+                eprintln!("warning: {error}");
+                continue;
+            }
+        };
+        let reported = info
+            .time
+            .map_or("--:--".to_owned(), |time| time.to_string());
+        match &mut clock {
+            Some(clock) => {
+                let before = clock.text(now);
+                let moved = clock.correct(now, &info);
+                println!(
+                    "server {reported}  clock {before}  moved {moved:+.0} game s  speed {:.2}x",
+                    clock.speed()
+                );
+            }
+            None => {
+                clock = server::GameClock::start(now, &info);
+                println!("server {reported}  clock started");
+            }
+        }
     }
 }
 
@@ -108,6 +172,12 @@ impl Report {
                     );
                 }
             }
+            Update::Recognised(elements) => {
+                if self.elements {
+                    let known = elements.iter().filter(|e| e.lead == Lead::Known).count();
+                    println!("  recognised from the list, {known} missed elements filled in");
+                }
+            }
             Update::Block(block) => self.block(&block),
         }
     }
@@ -121,6 +191,15 @@ impl Report {
             .count();
         let placed = block.code().and_then(|code| self.bunkers.record(&code));
         let placed = placed.map_or(String::new(), |slot| format!(" -> bunker {}", slot + 1));
+        let known = block
+            .elements
+            .iter()
+            .filter(|e| e.lead == Lead::Known)
+            .count();
+        let placed = match known {
+            0 => placed,
+            known => format!("{placed}, {known} from the list"),
+        };
         println!(
             "{:8.1}s  {:<9} {}  ({}/50 elements, {flags} flagged){placed}",
             start as f32 / 1000.0,
@@ -152,6 +231,9 @@ impl Report {
             if let Some(url) = bunker.map_url() {
                 println!("          {url}");
             }
+            if bunker.is_off_list() {
+                println!("          not on the bunker list");
+            }
         }
     }
 }
@@ -171,6 +253,7 @@ fn print_element(element: &Element) {
         Lead::DigitBreak => "digit break",
         Lead::StrayBreak => "STRAY BREAK",
         Lead::Drowned => "DROWNED",
+        Lead::Known => "from list",
     };
     println!(
         "  {:9.3}s  {}  on {:4} ms  gap {:5} ms  {note}",

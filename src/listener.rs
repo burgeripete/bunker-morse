@@ -3,6 +3,7 @@
 
 use crate::decoder::{Block, Decoder, Element, Output};
 use crate::detector::{Detector, Frame, HOP_MS, Keyer, Threshold, Tone};
+use crate::sites::NASDARA_BUNKERS;
 
 /// How often the signal displays get a new reading, in stream time.
 pub const SIGNAL_INTERVAL_MS: u64 = 50;
@@ -27,6 +28,8 @@ pub enum Update {
     Signal(Signal),
     Element(Element),
     Rejected(Tone),
+    /// The block in progress was recognised, and now reads like this.
+    Recognised(Vec<Element>),
     Block(Block),
 }
 
@@ -45,7 +48,7 @@ impl Listener {
         Self {
             detector: Detector::new(sample_rate, threshold),
             keyer: Keyer::default(),
-            decoder: Decoder::default(),
+            decoder: Decoder::with_known(&NASDARA_BUNKERS),
             frames: Vec::new(),
             output: Vec::new(),
             interval: Vec::with_capacity(FRAMES_PER_SIGNAL),
@@ -91,6 +94,7 @@ impl Listener {
             emit(match output {
                 Output::Element(element) => Update::Element(element),
                 Output::Rejected(tone) => Update::Rejected(tone),
+                Output::Recognised(elements) => Update::Recognised(elements),
                 Output::Block(block) => Update::Block(block),
             });
         }

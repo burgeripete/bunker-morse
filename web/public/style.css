@@ -377,6 +377,11 @@ a.coordinates:hover {
   font: 15px var(--mono);
 }
 
+.off-list {
+  color: var(--warning);
+  font-size: 13px;
+}
+
 /* A keypad code reads as the buttons it's entered on. */
 .keypad {
   display: flex;

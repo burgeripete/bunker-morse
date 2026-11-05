@@ -8,12 +8,21 @@
 //! after a dot (1.2 s), and the break between digits 6 and 7 is missing
 //! altogether. Gaps are only used to notice beeps that were drowned out, so a
 //! gunshot costs one digit rather than shifting the rest of the block.
+//!
+//! Joining a block partway through gives no pause to count from. Bunkers only
+//! exist at known coordinates, though, so what's been heard can usually be
+//! placed against that list, which supplies the part that was missed.
 
 use crate::detector::Tone;
 
 pub const ELEMENTS_PER_DIGIT: usize = 5;
 pub const DIGITS_PER_BLOCK: usize = 10;
 pub const ELEMENTS_PER_BLOCK: usize = ELEMENTS_PER_DIGIT * DIGITS_PER_BLOCK;
+const COORDINATE_DIGITS: usize = 6;
+const COORDINATE_ELEMENTS: usize = ELEMENTS_PER_DIGIT * COORDINATE_DIGITS;
+/// Coordinate elements that must be heard before trusting a match with the
+/// list: two digits, less a first beep that may have been clipped.
+const MIN_MATCHED_ELEMENTS: usize = 2 * ELEMENTS_PER_DIGIT - 1;
 
 /// Measured from a recording of the broadcast. A slot runs from the start of
 /// one element to the start of the next.
@@ -105,6 +114,8 @@ pub enum Lead {
     StrayBreak,
     /// A placeholder for a beep the gap says was there but was not heard.
     Drowned,
+    /// Not heard at all: filled in from the list of known coordinates.
+    Known,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,18 +188,97 @@ pub enum Output {
     Element(Element),
     /// A beep that does not fit the code, kept visible for debugging.
     Rejected(Tone),
+    /// The block being received was recognised, and now reads like this from
+    /// its start.
+    Recognised(Vec<Element>),
     Block(Block),
+}
+
+type Coordinates = [Symbol; COORDINATE_ELEMENTS];
+
+/// Whether heard elements could be the part of a block beginning at `start`.
+/// Returns how many coordinate elements matched.
+fn fit(elements: &[Element], coordinates: &Coordinates, start: usize) -> Option<usize> {
+    if start + elements.len() > ELEMENTS_PER_BLOCK {
+        return None;
+    }
+    let mut matched = 0;
+    for (index, element) in elements.iter().enumerate() {
+        let position = start + index;
+        // Listening can begin partway through a beep, which clips the first one.
+        let reliable = index > 0 && element.symbol != Symbol::Unknown;
+        if position < COORDINATE_ELEMENTS && reliable {
+            if element.symbol != coordinates[position] {
+                return None;
+            }
+            matched += 1;
+        }
+
+        // The gaps must agree too, which rules out most false positions. The gap
+        // after a clipped first beep can't be trusted either.
+        if index < 2 {
+            continue;
+        }
+        let after_drowned = elements[index - 1].lead == Lead::Drowned;
+        let digit_starts = position.is_multiple_of(ELEMENTS_PER_DIGIT);
+        let expects_break = digit_starts && position != COORDINATE_ELEMENTS;
+        match element.lead {
+            Lead::DigitBreak if !expects_break => return None,
+            Lead::Slot if expects_break && !after_drowned => return None,
+            _ => {}
+        }
+    }
+    keypad_is_possible(elements, start).then_some(matched)
+}
+
+/// Whether the elements heard in the keypad code could all be digits.
+fn keypad_is_possible(elements: &[Element], start: usize) -> bool {
+    (COORDINATE_DIGITS..DIGITS_PER_BLOCK).all(|digit| {
+        let first = digit * ELEMENTS_PER_DIGIT;
+        (0..10).any(|candidate| {
+            let expected = pattern(candidate);
+            (0..ELEMENTS_PER_DIGIT).all(|offset| {
+                (first + offset)
+                    .checked_sub(start)
+                    .and_then(|index| elements.get(index))
+                    .is_none_or(|e| e.symbol == Symbol::Unknown || e.symbol == expected[offset])
+            })
+        })
+    })
 }
 
 #[derive(Default)]
 pub struct Decoder {
     elements: Vec<Element>,
-    /// Whether the current block began right after a pause.
+    /// Whether positions in the current block are known, from a pause before
+    /// it or a match with the known coordinates.
     aligned: bool,
     last_end_ms: u64,
+    known: Vec<Coordinates>,
+    /// What the current block was recognised as, if it was, and how its first
+    /// beep really sounded, as it may be replaced by the list's.
+    recognised: Option<(Coordinates, Symbol)>,
 }
 
 impl Decoder {
+    /// A decoder that can recognise blocks for these six-digit coordinates.
+    pub fn with_known(coordinates: &[&str]) -> Self {
+        let known = coordinates
+            .iter()
+            .map(|digits| {
+                let symbols: Vec<Symbol> = digits
+                    .bytes()
+                    .flat_map(|digit| pattern(digit - b'0'))
+                    .collect();
+                symbols.try_into().expect("six digits of coordinates")
+            })
+            .collect();
+        Self {
+            known,
+            ..Self::default()
+        }
+    }
+
     pub fn tone(&mut self, tone: Tone, output: &mut Vec<Output>) {
         self.tick(tone.start_ms, output);
 
@@ -240,6 +330,9 @@ impl Decoder {
         self.elements.push(element);
         self.last_end_ms = tone.end_ms;
         output.push(Output::Element(element));
+        if !self.aligned {
+            self.recognise(false, output);
+        }
     }
 
     /// Advances time through silence, so a block ends as soon as its pause is
@@ -247,6 +340,10 @@ impl Decoder {
     pub fn tick(&mut self, now_ms: u64, output: &mut Vec<Output>) {
         if now_ms.saturating_sub(self.last_end_ms) < PAUSE_MS {
             return;
+        }
+        if !self.aligned {
+            // The pause says this was the end of a block, which pins it down.
+            self.recognise(true, output);
         }
         self.finish(output);
         self.aligned = true;
@@ -257,11 +354,28 @@ impl Decoder {
         if self.elements.is_empty() {
             return;
         }
+        // A match must end with a whole block, and coordinates heard after it
+        // must agree. If not, it was a coincidence, and is undone.
+        let recognised = self.recognised.take();
+        let mismatch = recognised.is_some_and(|(coordinates, _)| {
+            self.elements.len() != ELEMENTS_PER_BLOCK
+                || self
+                    .elements
+                    .iter()
+                    .zip(coordinates)
+                    .any(|(e, known)| e.symbol != Symbol::Unknown && e.symbol != known)
+        });
+        if mismatch {
+            self.elements.retain(|e| e.lead != Lead::Known);
+            if let (Some((_, heard)), Some(first)) = (recognised, self.elements.first_mut()) {
+                first.symbol = heard;
+            }
+        }
         // Exactly a block's worth is a whole block even with no pause before
         // it, as when listening starts during a pause shorter than `PAUSE_MS`.
         let kind = if self.elements.len() == ELEMENTS_PER_BLOCK {
             BlockKind::Complete
-        } else if !self.aligned {
+        } else if !self.aligned || mismatch {
             BlockKind::Tail
         } else {
             BlockKind::Damaged
@@ -276,6 +390,52 @@ impl Decoder {
     /// counting its elements gives digits.
     pub fn aligned(&self) -> bool {
         self.aligned
+    }
+
+    /// Tries to place an unaligned block against the known coordinates, and
+    /// fills in what was missed if exactly one place fits.
+    fn recognise(&mut self, at_block_end: bool, output: &mut Vec<Output>) {
+        let heard = self.elements.len();
+        if heard == 0 || heard >= ELEMENTS_PER_BLOCK {
+            return;
+        }
+        let last_start = ELEMENTS_PER_BLOCK - heard;
+        let starts = if at_block_end {
+            last_start..=last_start
+        } else {
+            1..=last_start
+        };
+        let mut found = None;
+        for coordinates in &self.known {
+            for start in starts.clone() {
+                if fit(&self.elements, coordinates, start)
+                    .is_some_and(|matched| matched >= MIN_MATCHED_ELEMENTS)
+                {
+                    if found.is_some() {
+                        return;
+                    }
+                    found = Some((*coordinates, start));
+                }
+            }
+        }
+        let Some((coordinates, start)) = found else {
+            return;
+        };
+        let missed = coordinates[..start].iter().map(|symbol| Element {
+            symbol: *symbol,
+            start_ms: 0,
+            duration_ms: 0,
+            gap_ms: 0,
+            lead: Lead::Known,
+        });
+        let heard_first = self.elements[0].symbol;
+        if let Some(first) = coordinates.get(start) {
+            self.elements[0].symbol = *first;
+        }
+        self.elements.splice(0..0, missed);
+        self.aligned = true;
+        self.recognised = Some((coordinates, heard_first));
+        output.push(Output::Recognised(self.elements.clone()));
     }
 
     fn drowned(&mut self, residual: i64, after_ms: u64, output: &mut Vec<Output>) {
@@ -441,6 +601,153 @@ mod tests {
         };
         assert_eq!(block.kind, BlockKind::Complete);
         assert_eq!(block.code(), Some(digits(FIRST)));
+    }
+
+    use crate::sites::NASDARA_BUNKERS;
+
+    fn digits_of(coordinates: &str, keypad: [u8; 4]) -> [u8; 10] {
+        let mut code = [0; 10];
+        for (slot, digit) in code.iter_mut().zip(coordinates.bytes()) {
+            *slot = digit - b'0';
+        }
+        code[6..].copy_from_slice(&keypad);
+        code
+    }
+
+    /// Joins a block at element `join` and returns how it ended.
+    fn join_at(code: &[u8; 10], join: usize) -> Block {
+        let mut decoder = Decoder::with_known(&NASDARA_BUNKERS);
+        let mut output = Vec::new();
+        let keys = block_keys(code);
+        play(&mut decoder, &keys[join..], 1_000, &mut output);
+        output
+            .into_iter()
+            .find_map(|o| match o {
+                Output::Block(block) => Some(block),
+                _ => None,
+            })
+            .expect("a block ends at the pause")
+    }
+
+    #[test]
+    fn a_block_joined_late_is_completed_from_the_list() {
+        let code = digits_of("107123", [0, 0, 3, 4]);
+        // Joined at the start of the fourth digit, missing `107`.
+        let block = join_at(&code, 15);
+        assert_eq!(block.kind, BlockKind::Complete);
+        assert_eq!(block.code(), Some(digits(code)));
+        let known = block.elements.iter().filter(|e| e.lead == Lead::Known);
+        assert_eq!(known.count(), 15);
+    }
+
+    #[test]
+    fn a_block_is_recognised_as_soon_as_only_one_place_fits() {
+        let code = digits_of("107123", [0, 0, 3, 4]);
+        let mut decoder = Decoder::with_known(&NASDARA_BUNKERS);
+        let mut output = Vec::new();
+        let keys = block_keys(&code);
+        // Fourteen elements: twelve would still fit 067124 as well.
+        let (join, stop) = (15, 29);
+        play(&mut decoder, &keys[join..stop], 1_000, &mut output);
+        let elements = output.iter().find_map(|o| match o {
+            Output::Recognised(elements) => Some(elements),
+            _ => None,
+        });
+        let elements = elements.expect("recognised before the block ended");
+        assert!(elements.len() >= 25);
+        assert!(decoder.aligned());
+    }
+
+    #[test]
+    fn every_bunker_joined_anywhere_gives_its_code_or_nothing() {
+        let keypads = [[0, 0, 3, 4], [6, 8, 7, 0], [3, 6, 3, 6], [9, 1, 5, 2]];
+        for coordinates in NASDARA_BUNKERS {
+            for keypad in keypads {
+                let code = digits_of(coordinates, keypad);
+                for join in 1..50 {
+                    let block = join_at(&code, join);
+                    let heard = block.digits();
+                    if let Some(found) = block.code() {
+                        assert_eq!(found, digits(code), "{coordinates} joined at {join}");
+                    }
+                    for (seen, truth) in heard.iter().zip(code) {
+                        assert!(
+                            seen.is_none_or(|digit| digit == truth),
+                            "{coordinates} {join}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hearing_four_coordinate_digits_is_always_enough() {
+        for coordinates in NASDARA_BUNKERS {
+            let code = digits_of(coordinates, [4, 2, 7, 1]);
+            for join in 1..=10 {
+                let block = join_at(&code, join);
+                assert_eq!(block.kind, BlockKind::Complete, "{coordinates} at {join}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_first_beep_clipped_by_joining_does_not_spoil_a_match() {
+        let code = digits_of("057074", [6, 8, 7, 0]);
+        let mut keys = block_keys(&code);
+        // Joined during the first dash of the fourth digit, so it reads as a dot.
+        keys[15].on_ms = 120;
+        let mut decoder = Decoder::with_known(&NASDARA_BUNKERS);
+        let mut output = Vec::new();
+        play(&mut decoder, &keys[15..], 1_000, &mut output);
+        let block = output.iter().find_map(|o| match o {
+            Output::Block(block) => Some(block),
+            _ => None,
+        });
+        assert_eq!(block.unwrap().code(), Some(digits(code)));
+    }
+
+    #[test]
+    fn bunkers_with_the_same_last_digits_wait_for_a_digit_that_differs() {
+        // 073090 and 065090 both end in 090.
+        let code = digits_of("073090", [4, 2, 7, 1]);
+        assert_eq!(join_at(&code, 15).kind, BlockKind::Tail);
+        assert_eq!(join_at(&code, 10).kind, BlockKind::Complete);
+    }
+
+    #[test]
+    fn a_keypad_code_that_looks_like_coordinates_is_not_trusted() {
+        // 00 in the keypad code matches the end of 028100, but the pause comes
+        // too early for that, so the match is undone.
+        let code = digits_of("057074", [0, 0, 3, 4]);
+        let block = join_at(&code, 30);
+        assert_eq!(block.kind, BlockKind::Tail);
+        assert_eq!(format_code(&block.digits()), "?????? 0034");
+    }
+
+    #[test]
+    fn a_block_joined_in_the_keypad_code_cannot_be_placed() {
+        let code = digits_of("057074", [6, 8, 7, 0]);
+        let block = join_at(&code, 30);
+        assert_eq!(block.kind, BlockKind::Tail);
+        assert_eq!(format_code(&block.digits()), "?????? 6870");
+    }
+
+    #[test]
+    fn a_contradicted_match_is_damaged_not_trusted() {
+        // Recognised as 107123, then the last coordinate digit disagrees.
+        let code = digits_of("107123", [0, 0, 3, 4]);
+        let mut keys = block_keys(&code);
+        keys[25..30].copy_from_slice(&block_keys(&digits_of("107128", [0, 0, 3, 4]))[25..30]);
+        let mut decoder = Decoder::with_known(&["107123", "000000"]);
+        let mut output = Vec::new();
+        play(&mut decoder, &keys[5..], 1_000, &mut output);
+        let block = output.iter().find_map(|o| match o {
+            Output::Block(block) => Some(block),
+            _ => None,
+        });
+        assert_eq!(block.unwrap().code(), None);
     }
 
     #[test]

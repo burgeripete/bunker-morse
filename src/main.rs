@@ -16,7 +16,7 @@ fn main() {
             Theme::change(ThemeMode::Dark, None, cx);
 
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::centered(size(px(960.), px(920.)), cx)),
+                window_bounds: Some(WindowBounds::centered(size(px(960.), px(990.)), cx)),
                 window_min_size: Some(size(px(760.), px(480.))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Bunker Morse".into()),

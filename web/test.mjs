@@ -38,6 +38,31 @@ function feed(session, samples) {
 
 const ofType = (events, type) => events.filter((event) => event.type === type);
 
+const MORSE = [
+  "-----", ".----", "..---", "...--", "....-",
+  ".....", "-....", "--...", "---..", "----.",
+];
+
+/** One block with the real broadcast's timing, ending in its long pause. */
+function broadcast(coordinates, keypad, rate) {
+  const samples = [];
+  const digits = [...(coordinates + keypad)];
+  digits.forEach((digit, index) => {
+    [...MORSE[digit]].forEach((mark, position) => {
+      const [on, slot] = mark === "-" ? [500, 1900] : [120, 900];
+      let off = slot - on;
+      if (position === 4 && index === digits.length - 1) off += 6000;
+      else if (position === 4 && index !== 5) off += 400;
+      for (let n = 0; n < (on * rate) / 1000; n++) {
+        samples.push(0.05 * Math.sin((2 * Math.PI * 988 * n) / rate));
+      }
+      for (let n = 0; n < (off * rate) / 1000; n++) samples.push(0);
+    });
+  });
+  // A trace of noise, because a bare tone over digital silence isn't realistic.
+  return Float32Array.from(samples, (s, i) => s + 0.0005 * Math.sin(i * i));
+}
+
 test("decodes the real broadcast", () => {
   const { rate, samples } = clip();
   const session = new Session(wasm, rate);
@@ -53,6 +78,31 @@ test("decodes the real broadcast", () => {
   assert.equal(bunker.gps, "X: 0.57  Y: 0.74");
   assert.equal(bunker.url, "https://www.izurvive.com/nasdara/#location=5700;8984;6");
   assert.equal(bunker.confirmed, false);
+});
+
+test("a block joined partway through is completed from the list", () => {
+  const { rate, samples } = clip();
+  // Joined about 40 seconds into the block that starts 10 seconds into the clip.
+  const session = new Session(wasm, rate);
+  const events = feed(session, samples.subarray(rate * 40));
+  session.free();
+
+  assert.equal(ofType(events, "recognised").length, 1);
+  const [block] = ofType(events, "block").filter((b) => b.kind === "complete");
+  assert.equal(block.digits, "057074 6870");
+  assert.ok(block.known > 0);
+});
+
+test("a code that isn't on the list is flagged", () => {
+  const rate = 16000;
+  const session = new Session(wasm, rate);
+  feed(session, new Float32Array(rate * 7));
+  const events = feed(session, broadcast("123456", "7890", rate));
+  session.free();
+
+  const [bunker] = ofType(events, "bunkers").at(-1).slots;
+  assert.equal(bunker.raw, "123456");
+  assert.equal(bunker.offList, true);
 });
 
 test("reports the signal for the displays", () => {

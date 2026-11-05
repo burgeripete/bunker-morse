@@ -39,6 +39,7 @@ impl Session {
             Update::Signal(signal) => write_signal(output, &signal),
             Update::Element(element) => write_element(output, &element),
             Update::Rejected(tone) => write_rejected(output, tone),
+            Update::Recognised(elements) => write_recognised(output, &elements),
             Update::Block(block) => {
                 write_block(output, &block);
                 if let Some(code) = block.code() {
@@ -88,6 +89,7 @@ fn lead_name(lead: Lead) -> &'static str {
         Lead::DigitBreak => "break",
         Lead::StrayBreak => "stray",
         Lead::Drowned => "drowned",
+        Lead::Known => "known",
     }
 }
 
@@ -101,6 +103,17 @@ fn write_element(out: &mut String, element: &Element) {
         element.gap_ms,
         lead_name(element.lead),
     );
+}
+
+fn write_recognised(out: &mut String, elements: &[Element]) {
+    out.push_str(r#"{"type":"recognised","elements":["#);
+    for (index, element) in elements.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        write_element(out, element);
+    }
+    out.push_str("]}");
 }
 
 fn write_rejected(out: &mut String, tone: Tone) {
@@ -123,9 +136,14 @@ fn write_block(out: &mut String, block: &Block) {
         .iter()
         .filter(|e| matches!(e.lead, Lead::StrayBreak | Lead::Drowned))
         .count();
+    let known = block
+        .elements
+        .iter()
+        .filter(|e| e.lead == Lead::Known)
+        .count();
     let _ = write!(
         out,
-        r#"{{"type":"block","kind":"{kind}","digits":"{}","elements":{},"flagged":{flagged},"start":{}}}"#,
+        r#"{{"type":"block","kind":"{kind}","digits":"{}","elements":{},"flagged":{flagged},"known":{known},"start":{}}}"#,
         format_code(&block.digits()),
         block.elements.len(),
         block.elements.first().map_or(0, |e| e.start_ms),
@@ -149,11 +167,12 @@ fn write_bunker(out: &mut String, bunker: &Bunker) {
     }
     let _ = write!(
         out,
-        r#"],"raw":"{}","gps":"{}","passes":{},"confirmed":{},"url":"#,
+        r#"],"raw":"{}","gps":"{}","passes":{},"confirmed":{},"offList":{},"url":"#,
         bunker.raw_coordinates(),
         bunker.gps(),
         bunker.passes,
         bunker.is_confirmed(),
+        bunker.is_off_list(),
     );
     match bunker.map_url() {
         Some(url) => {

@@ -57,6 +57,30 @@ fn decodes_the_real_broadcast() {
 }
 
 #[test]
+fn a_block_joined_partway_through_is_completed_from_the_list() {
+    let (samples, rate) = clip();
+    // The block starts about 10 s into the clip, and each digit takes 4 to 9 s.
+    // Some of these land in the middle of a beep.
+    for join_seconds in (11..=41).step_by(3) {
+        let blocks = blocks(&samples[join_seconds * rate..], rate);
+        assert_eq!(
+            complete_codes(&blocks),
+            [EXPECTED],
+            "joined at {join_seconds} s"
+        );
+    }
+}
+
+#[test]
+fn a_block_joined_too_late_keeps_only_what_was_heard() {
+    let (samples, rate) = clip();
+    let blocks = blocks(&samples[50 * rate..], rate);
+    assert!(complete_codes(&blocks).is_empty());
+    let digits = |b: &Block| format_code(&b.digits());
+    assert!(blocks.iter().any(|b| digits(b) == "?????? 6870"));
+}
+
+#[test]
 fn does_not_depend_on_game_volume() {
     let (samples, rate) = clip();
     let quiet: Vec<f32> = samples.iter().map(|s| s * 0.01).collect();

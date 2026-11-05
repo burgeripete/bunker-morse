@@ -81,10 +81,28 @@ Windows 10 2004 or later to capture a single process.
 4. Click a card's coordinates to open them on the iZurvive Nasdara map in your
    browser. The link appears once all six coordinate digits are known.
 
+To see a server's in-game time, enter its address and query port under **Server**
+and press **Get time**, for example `5.62.99.22:11601`. It must be the query port,
+not the game port. A running `HH:MM:SS` clock follows the server's time speed, and
+every minute the app asks the server again and corrects the time and speed if
+they differ. The clock can read a few minutes ahead of the server's own figure,
+because servers only refresh it about once a minute. Press **Stop** to end it. The app remembers the address. This uses the public query that
+server browsers use, so it needs no login and works without the game. It's only
+in the desktop app, because web pages can't send this kind of network request.
+
 Digits are white when heard once and green when a later pass agrees. Amber means
 passes disagree, and the most common value is shown. Bunker numbers are simply
-the order they were first heard. If you join partway through a block, its digits
-start after the next pause.
+the order they were first heard. 
+If you join partway through a block, the digits heard so far are matched against
+the list of Nasdara bunkers in `src/sites.rs`. Once two or more coordinate digits
+fit exactly one place, the missed start is filled in from the list and the block
+carries on, so you get its keypad code on that pass. Joining during the keypad code
+leaves nothing to match, so that block waits for the next pass. If the bunkers
+change, update the list.
+
+A fully heard code whose coordinates aren't on the list is still shown, marked
+**Not on list**. That means a misheard digit or a bunker missing from the list, so
+wait for a repeat before trusting it.
 
 Press **Reset** after a server restart. A code that fits no bunker raises a
 notice rather than replacing one.
@@ -131,6 +149,7 @@ cargo test
 cargo run --bin bunker-morse-cli -- decode recording.mkv --elements
 cargo run --bin bunker-morse-cli -- listen DayZ_x64.exe --elements
 cargo run --bin bunker-morse-cli -- loopback-test
+cargo run --bin bunker-morse-cli -- server 5.62.99.22:11601 --watch
 ```
 
 `decode` reads an OBS recording faster than real time and prints every block,

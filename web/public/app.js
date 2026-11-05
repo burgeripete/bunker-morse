@@ -163,6 +163,9 @@ function handle(events) {
       case "rejected":
         state.rejected += 1;
         break;
+      case "recognised":
+        state.received = event.elements;
+        break;
       case "block":
         state.received = [];
         state.log.unshift(event);
@@ -249,6 +252,9 @@ function bunkerCard(index, bunker) {
   gps.className = "gps";
   gps.textContent = bunker?.gps ?? "X: -.--  Y: -.--";
   coordinates.append(head, digitRun(bunker, 0, 6), gps);
+  if (bunker?.offList) {
+    coordinates.append(span("off-list", "Not on list, wait for a repeat"));
+  }
 
   const keypad = span("card-label", "Keypad code");
   card.append(title, coordinates, keypad, digitRun(bunker, 6, 10, "digits keypad"));
@@ -342,6 +348,7 @@ const LEAD_LABELS = {
   break: "digit break",
   stray: "stray break",
   drowned: "drowned",
+  known: "from list",
 };
 
 function renderStats() {
@@ -387,9 +394,10 @@ function renderStats() {
     ...state.log.map((block) => {
       const kind = { complete: "ok", tail: "tail", damaged: "damaged" }[block.kind];
       const count = `${kind} ${block.elements}/${ELEMENTS_PER_BLOCK}`;
+      const known = block.known ? `, ${block.known} from list` : "";
       const flags = block.flagged ? `, ${block.flagged} flagged` : "";
       return row(
-        [formatTime(block.start), block.digits, count + flags],
+        [formatTime(block.start), block.digits, count + known + flags],
         block.kind === "damaged" || block.flagged > 0,
       );
     }),

@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use bunker_morse::bunkers::{BUNKER_COUNT, Bunker, Bunkers, DigitState};
 use bunker_morse::capture::{self, AudioApp};
@@ -11,7 +12,9 @@ use bunker_morse::decoder::{
 };
 use bunker_morse::detector::{self, DEFAULT_TONE_HZ, Threshold};
 use bunker_morse::engine::{Engine, Event, Signal, Source, Update};
+use bunker_morse::server::{GameClock, ServerInfo, ServerWatch};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
@@ -26,12 +29,15 @@ use gpui_kit::{
 use crate::scope::{self, Reading, SCOPE_READINGS};
 
 const DEFAULT_PROCESS: &str = "DayZ_x64.exe";
+const OFF_LIST_WARNING: &str = "Not on list, wait for a repeat";
 const MONOSPACE: &str = "Consolas";
 const MAX_LOG_ROWS: usize = 8;
 const RECENT_ELEMENTS: usize = 8;
 /// Meters span this range of dBFS.
 const METER_FLOOR_DB: f32 = -80.0;
 const TONE_METER_DB: f32 = 60.0;
+/// Quicker than a game second at any usual time speed.
+const CLOCK_TICK: Duration = Duration::from_millis(100);
 /// The slider's range, inside the plot's 0 to 60 dB scale.
 const MIN_THRESHOLD_DB: f32 = 10.0;
 const MAX_THRESHOLD_DB: f32 = 55.0;
@@ -89,6 +95,8 @@ struct LogRow {
     digits: String,
     elements: usize,
     flagged: usize,
+    /// Elements filled in from the known coordinates, not heard.
+    from_list: usize,
 }
 
 pub struct BunkerMorse {
@@ -108,6 +116,15 @@ pub struct BunkerMorse {
     show_debug: bool,
     threshold: Threshold,
     threshold_slider: Entity<SliderState>,
+    server_address: Entity<InputState>,
+    server_watch: Option<ServerWatch>,
+    /// The latest answer, kept on screen if a later query fails.
+    server: Option<ServerInfo>,
+    server_error: Option<SharedString>,
+    clock: Option<GameClock>,
+    clock_text: Option<SharedString>,
+    _server_pump: Option<Task<()>>,
+    _clock_tick: Option<Task<()>>,
     _pump: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -132,6 +149,12 @@ impl BunkerMorse {
         });
         let threshold = Threshold::default();
         let slider_target = threshold.clone();
+        let saved_server = load_server_address();
+        let server_address = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("address:query port")
+                .default_value(saved_server)
+        });
         let subscriptions = vec![
             cx.subscribe_in(
                 &process,
@@ -169,6 +192,14 @@ impl BunkerMorse {
             show_debug: true,
             threshold,
             threshold_slider,
+            server_address,
+            server_watch: None,
+            server: None,
+            server_error: None,
+            clock: None,
+            clock_text: None,
+            _server_pump: None,
+            _clock_tick: None,
             _pump: None,
             _subscriptions: subscriptions,
         };
@@ -292,6 +323,7 @@ impl BunkerMorse {
                 self.recent.push_back(element);
             }
             Update::Rejected(_) => self.rejected += 1,
+            Update::Recognised(elements) => self.received = elements,
             Update::Block(block) => self.on_block(block),
         }
     }
@@ -310,6 +342,11 @@ impl BunkerMorse {
             digits: format_code(&block.digits()),
             elements: block.elements.len(),
             flagged: flagged(&block.elements),
+            from_list: block
+                .elements
+                .iter()
+                .filter(|e| e.lead == Lead::Known)
+                .count(),
         });
         if self.bunkers.unplaced > 0 {
             self.notice = Some(
@@ -482,6 +519,139 @@ impl BunkerMorse {
                         this.refresh_apps(window, cx);
                     })),
             )
+    }
+
+    /// Starts or stops asking the server for its time.
+    fn toggle_server(&mut self, cx: &mut Context<Self>) {
+        if self.server_watch.take().is_some() {
+            self._server_pump = None;
+            self._clock_tick = None;
+            self.clock = None;
+            self.clock_text = None;
+            cx.notify();
+            return;
+        }
+        let address = self.server_address.read(cx).value().trim().to_owned();
+        if address.is_empty() {
+            self.server_error = Some("Enter the server's address and query port.".into());
+            cx.notify();
+            return;
+        }
+        save_server_address(&address);
+        self.server = None;
+        self.server_error = None;
+        let (watch, results) = ServerWatch::start(address);
+        self.server_watch = Some(watch);
+        self._server_pump = Some(cx.spawn(async move |this, cx| {
+            while let Ok(result) = results.recv_async().await {
+                let updated = this.update(cx, |this, cx| {
+                    match result {
+                        Ok(info) => {
+                            let now = Instant::now();
+                            match &mut this.clock {
+                                Some(clock) => {
+                                    clock.correct(now, &info);
+                                }
+                                None => this.clock = GameClock::start(now, &info),
+                            }
+                            this.server = Some(info);
+                            this.server_error = None;
+                            this.update_clock_text(cx);
+                        }
+                        Err(error) => this.server_error = Some(error.into()),
+                    }
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        }));
+        self._clock_tick = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CLOCK_TICK).await;
+                if this
+                    .update(cx, |this, cx| this.update_clock_text(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Redraws only when the displayed second changes.
+    fn update_clock_text(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let text: Option<SharedString> = self.clock.as_ref().map(|c| c.text(now).into());
+        if text != self.clock_text {
+            self.clock_text = text;
+            cx.notify();
+        }
+    }
+
+    fn render_server(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let watching = self.server_watch.is_some();
+        let time = self.clock_text.clone();
+        let details: Option<SharedString> = match &self.server {
+            Some(server) => Some(server_details(server).into()),
+            None if watching && self.server_error.is_none() => Some("Asking the server".into()),
+            None => None,
+        };
+        let error = self.server_error.clone();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(52.))
+                            .flex_none()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Server"),
+                    )
+                    .child(
+                        div().w(px(228.)).child(
+                            Input::new(&self.server_address)
+                                .disabled(watching)
+                                .into_any_element(),
+                        ),
+                    )
+                    .child(if watching {
+                        Button::new("server")
+                            .label("Stop")
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_server(cx)))
+                    } else {
+                        Button::new("server")
+                            .label("Get time")
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_server(cx)))
+                    })
+                    .when_some(time, |row, time| {
+                        row.child(
+                            div()
+                                .font_family(MONOSPACE)
+                                .text_size(px(24.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(time),
+                        )
+                    }),
+            )
+            .when_some(details, |column, details| {
+                column.child(div().text_sm().text_color(muted).child(details))
+            })
+            .when_some(error, |column, error| {
+                column.child(div().text_sm().text_color(danger).child(error))
+            })
     }
 
     fn render_bunkers(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -721,6 +891,56 @@ impl BunkerMorse {
     }
 }
 
+/// `server.txt` in the app's roaming folder, so the address survives a restart.
+fn server_address_path() -> Option<PathBuf> {
+    let folder = std::env::var_os("APPDATA")?;
+    Some(
+        PathBuf::from(folder)
+            .join("bunker-morse")
+            .join("server.txt"),
+    )
+}
+
+fn load_server_address() -> String {
+    server_address_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|address| address.trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn save_server_address(address: &str) {
+    let Some(path) = server_address_path() else {
+        return;
+    };
+    let saved = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(path, address));
+    if let Err(error) = saved {
+        log::warn!("saving the server address: {error}");
+    }
+}
+
+fn time_speed(server: &ServerInfo) -> Option<String> {
+    match (server.day_speed?, server.night_speed) {
+        (day, Some(night)) if day != night => Some(format!("day {day}x, night {night}x")),
+        (day, _) => Some(format!("time {day}x")),
+    }
+}
+
+fn server_details(server: &ServerInfo) -> String {
+    let mut parts = vec![
+        server.name.clone(),
+        server.map.clone(),
+        format!("{}/{} players", server.players, server.max_players),
+    ];
+    parts.extend(time_speed(server));
+    if server.time.is_none() {
+        parts.push("no game time reported".to_owned());
+    }
+    parts.join(" · ")
+}
+
 fn flagged(elements: &[Element]) -> usize {
     elements
         .iter()
@@ -735,6 +955,7 @@ fn lead_label(lead: Lead) -> &'static str {
         Lead::DigitBreak => "digit break",
         Lead::StrayBreak => "stray break",
         Lead::Drowned => "drowned",
+        Lead::Known => "from list",
     }
 }
 
@@ -745,6 +966,10 @@ fn block_note(row: &LogRow) -> String {
         BlockKind::Damaged => "damaged",
     };
     let count = format!("{kind} {}/{ELEMENTS_PER_BLOCK}", row.elements);
+    let count = match row.from_list {
+        0 => count,
+        from_list => format!("{count}, {from_list} from list"),
+    };
     match row.flagged {
         0 => count,
         flagged => format!("{count}, {flagged} flagged"),
@@ -826,6 +1051,7 @@ fn bunker_card(
     let label = |text: &'static str| div().text_xs().text_color(palette.muted).child(text);
     let map_url = bunker.and_then(Bunker::map_url);
     let has_map = map_url.is_some();
+    let off_list = bunker.is_some_and(Bunker::is_off_list);
     let coordinates = div()
         .id(("coordinates", index))
         .flex()
@@ -857,6 +1083,14 @@ fn bunker_card(
                 .text_color(palette.muted)
                 .child(bunker.map_or_else(|| Bunker::default().gps(), Bunker::gps)),
         )
+        .when(off_list, |area| {
+            area.child(
+                div()
+                    .text_sm()
+                    .text_color(palette.disputed)
+                    .child(OFF_LIST_WARNING),
+            )
+        })
         .when_some(map_url, |area, url| {
             area.cursor_pointer()
                 .hover(move |style| style.bg(palette.hover))
@@ -908,6 +1142,7 @@ impl Render for BunkerMorse {
             .text_color(foreground)
             .child(self.render_header(cx))
             .child(self.render_source(cx))
+            .child(self.render_server(cx))
             .when_some(notice, |root, notice| {
                 root.child(div().text_sm().text_color(danger).child(notice))
             })
@@ -930,6 +1165,34 @@ mod tests {
             gap_ms: 0,
             lead: Lead::Slot,
         }
+    }
+
+    fn server(day: Option<f32>, night: Option<f32>) -> ServerInfo {
+        ServerInfo {
+            name: "Test server".into(),
+            map: "nasdara".into(),
+            version: "1.30".into(),
+            players: 60,
+            max_players: 60,
+            time: None,
+            day_speed: day,
+            night_speed: night,
+        }
+    }
+
+    #[test]
+    fn server_details_read_as_one_line() {
+        assert_eq!(
+            server_details(&server(Some(3.29), Some(3.29))),
+            "Test server · nasdara · 60/60 players · time 3.29x · no game time reported"
+        );
+    }
+
+    #[test]
+    fn different_day_and_night_speeds_are_both_shown() {
+        let speed = time_speed(&server(Some(2.0), Some(12.0)));
+        assert_eq!(speed.as_deref(), Some("day 2x, night 12x"));
+        assert_eq!(time_speed(&server(None, None)), None);
     }
 
     #[test]

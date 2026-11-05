@@ -4,6 +4,7 @@
 //! digit damaged on one pass is settled by the others.
 
 use crate::decoder::{Code, DIGITS_PER_BLOCK};
+use crate::sites::NASDARA_BUNKERS;
 
 pub const BUNKER_COUNT: usize = 3;
 /// A block joins a bunker when enough digits are known on both sides and at
@@ -63,6 +64,13 @@ impl Bunker {
     /// The six coordinate digits, `057074`, with `-` for those not known.
     pub fn raw_coordinates(&self) -> String {
         (0..6).map(|index| self.digit_char(index)).collect()
+    }
+
+    /// Whether all six coordinate digits are known and aren't a known bunker,
+    /// which means a misheard digit or a bunker missing from the list.
+    pub fn is_off_list(&self) -> bool {
+        let raw = self.raw_coordinates();
+        !raw.contains('-') && !NASDARA_BUNKERS.contains(&raw.as_str())
     }
 
     /// The coordinates as a GPS reads them, `X: 0.57  Y: 0.74`.
@@ -267,6 +275,52 @@ mod tests {
         assert_eq!(bunkers.slots[0].map_url(), None);
         bunkers.record(&code(B));
         assert!(bunkers.slots[0].map_url().is_some());
+    }
+
+    #[test]
+    fn coordinates_on_the_list_are_not_flagged() {
+        let mut bunkers = Bunkers::default();
+        for digits in [A, B, C] {
+            bunkers.record(&code(digits));
+        }
+        assert!(bunkers.slots.iter().all(|bunker| !bunker.is_off_list()));
+    }
+
+    #[test]
+    fn coordinates_missing_from_the_list_are_flagged() {
+        let mut bunkers = Bunkers::default();
+        bunkers.record(&code(D));
+        assert!(bunkers.slots[0].is_off_list());
+    }
+
+    #[test]
+    fn a_keypad_code_has_no_bearing_on_the_list() {
+        let mut digits = A;
+        digits[6..].copy_from_slice(&[9, 9, 9, 9]);
+        let mut bunkers = Bunkers::default();
+        bunkers.record(&code(digits));
+        assert!(!bunkers.slots[0].is_off_list());
+    }
+
+    #[test]
+    fn unfinished_coordinates_are_not_flagged() {
+        let mut damaged = code(D);
+        damaged[2] = None;
+        let mut bunkers = Bunkers::default();
+        bunkers.record(&damaged);
+        assert!(!bunkers.slots[0].is_off_list());
+    }
+
+    #[test]
+    fn a_repeat_that_corrects_a_digit_clears_the_flag() {
+        let mut misheard = code(A);
+        misheard[5] = Some(3);
+        let mut bunkers = Bunkers::default();
+        bunkers.record(&misheard);
+        assert!(bunkers.slots[0].is_off_list());
+        bunkers.record(&code(A));
+        bunkers.record(&code(A));
+        assert!(!bunkers.slots[0].is_off_list());
     }
 
     #[test]

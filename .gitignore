@@ -1,0 +1,5 @@
+/target
+/web/target
+/web/public/*.wasm
+*.wav
+!/assets/**/*.wav

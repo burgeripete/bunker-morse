@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bunker Morse</title>
+    <meta
+      name="description"
+      content="Decodes the DayZ bunker Morse broadcast from shared audio into coordinates and keypad codes. Runs entirely in your browser."
+    />
+    <link rel="stylesheet" href="style.css" />
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Bunker Morse</h1>
+        <span id="lamp" class="lamp" title="Lights on each beep"></span>
+        <p id="status" class="status" role="status">Stopped</p>
+        <label class="toggle">
+          <input id="debug-toggle" type="checkbox" checked />
+          Debug
+        </label>
+        <button id="reset" type="button">Reset</button>
+        <button id="start" type="button" class="primary">Start</button>
+      </header>
+
+      <p id="notice" class="notice" role="alert" hidden></p>
+
+      <details id="help" open>
+        <summary>How to share DayZ's sound</summary>
+        <ol>
+          <li>Press <strong>Start</strong> in Chrome or Edge on a computer.</li>
+          <li>
+            Pick the DayZ window if your browser offers to share its audio.
+            Otherwise pick <strong>Entire screen</strong>.
+          </li>
+          <li>
+            Turn on the <strong>share audio</strong> option in the share dialog.
+            Without it, the page hears nothing.
+          </li>
+          <li>Keep this page open while you play. A background tab is fine.</li>
+        </ol>
+        <p>
+          Everything runs in this page. Nothing you share is uploaded or stored,
+          and the page never plays sound.
+        </p>
+      </details>
+
+      <section id="bunkers" class="cards" aria-label="Bunkers"></section>
+
+      <section class="receiving" aria-label="Current block">
+        <p id="receiving">Waiting for a pause to line up on a block</p>
+        <p id="symbols" class="mono muted"></p>
+      </section>
+
+      <section class="signal" aria-label="Signal">
+        <div class="meters">
+          <div class="meter">
+            <span>Audio level</span>
+            <div class="track"><div id="level" class="fill level"></div></div>
+          </div>
+          <div class="meter">
+            <span>Beep tone</span>
+            <div class="track"><div id="tone" class="fill tone"></div></div>
+          </div>
+        </div>
+        <div class="threshold">
+          <label for="threshold">Threshold</label>
+          <input
+            id="threshold"
+            type="range"
+            min="10"
+            max="55"
+            step="1"
+            value="30"
+            disabled
+          />
+          <output id="threshold-value" class="mono" for="threshold">-</output>
+          <label class="toggle">
+            <input id="threshold-auto" type="checkbox" checked />
+            Auto
+          </label>
+        </div>
+        <canvas id="scope" height="110"></canvas>
+        <div class="legend">
+          <span>30 s ago</span>
+          <span>tone level, threshold line, keyed beeps along the bottom</span>
+          <span>now</span>
+        </div>
+      </section>
+
+      <section id="debug" class="debug" aria-label="Debug">
+        <div>
+          <dl id="stats"></dl>
+          <h2>Spectrum, 600 to 1500 Hz</h2>
+          <canvas id="spectrum" height="70"></canvas>
+        </div>
+        <div>
+          <h2>Latest beeps: time, symbol, length, silence before</h2>
+          <div id="beeps" class="rows mono"></div>
+        </div>
+        <div>
+          <h2>Blocks</h2>
+          <div id="blocks" class="rows mono"></div>
+        </div>
+      </section>
+
+      <footer>
+        <label class="file">
+          Test with a recording
+          <input id="file" type="file" accept="audio/*,video/mp4,video/webm" />
+        </label>
+        <span class="muted">It's decoded without being played or uploaded.</span>
+      </footer>
+    </main>
+  </body>
+</html>

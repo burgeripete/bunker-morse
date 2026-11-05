@@ -1,0 +1,23 @@
+[package]
+name = "bunker-morse-web"
+version = "0.1.0"
+edition = "2024"
+description = "The Bunker Morse decoder as a WebAssembly module for the static web page."
+publish = false
+
+# Kept out of any parent workspace: this builds on its own for wasm32.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bunker-morse = { path = "..", default-features = false }
+
+# Tuned for speed: the detector runs a frequency bank on every 10 ms of audio.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
